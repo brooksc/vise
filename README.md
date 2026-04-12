@@ -4,6 +4,10 @@ A Claude Code plugin that locks your documents in a dual-LLM review vise. Claude
 
 Like a craftsman's vise that holds a workpiece rigid while precision tools are applied, the append-only debate ledger prevents the LLMs from hallucinating or drifting while they hammer out architectural flaws.
 
+## Why Gemini CLI?
+
+The Gemini CLI authenticates via your Google account (OAuth), not API keys. If you have a Gemini subscription or access through Google One, the CLI uses that entitlement directly — no separate API billing, no per-token charges. This makes Vise essentially free to run on the reviewer side.
+
 ## Prerequisites
 
 1. [Claude Code](https://claude.com/claude-code) installed
