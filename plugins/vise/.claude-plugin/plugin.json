@@ -1,0 +1,9 @@
+{
+  "name": "vise",
+  "description": "Vise Coding: dual-LLM document review via Claude + Gemini debate",
+  "version": "1.0.0",
+  "author": {
+    "name": "Brooks Cutter"
+  },
+  "license": "MIT"
+}

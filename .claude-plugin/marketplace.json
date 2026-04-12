@@ -1,0 +1,20 @@
+{
+  "name": "vise",
+  "owner": {
+    "name": "Brooks Cutter"
+  },
+  "metadata": {
+    "description": "Vise Coding: lock your docs in a dual-LLM review vise. Claude architects, Gemini reviews, iterate until convergence.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "vise",
+      "source": "./plugins/vise",
+      "description": "Iteratively refine markdown docs via Claude + Gemini debate. /vise:review <path> [N iterations]",
+      "version": "1.0.0",
+      "keywords": ["review", "gemini", "debate", "dual-llm", "document", "vise"],
+      "category": "development-workflows"
+    }
+  ]
+}
