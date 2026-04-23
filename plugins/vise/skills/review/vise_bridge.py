@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vise bridge: pipe a target doc + debate ledger through the Gemini CLI."""
+"""vise bridge: pipe a target doc + debate ledger through Gemini or Codex CLI."""
 import argparse
 import subprocess
 import sys
@@ -10,24 +10,19 @@ import shutil
 import fcntl
 from pathlib import Path
 
-# Default to the working Gemini 3 Pro ID confirmed against the CLI.
-# Override via env var if Google renames it.
+# Reviewer selection: "auto" tries gemini first, then codex; or force one.
+REVIEWER = os.environ.get("VISE_REVIEWER", "auto").lower()
+
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-pro-preview")
-# Soft guard against context bloat. Char count is a rough proxy for tokens;
-# dense code or CJK will hit real token limits earlier. Lower if you see API
-# 400s before this trips.
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "o4-mini")
 MAX_PAYLOAD_CHARS = 750_000
-# Kill a hung gemini subprocess after this many seconds.
 SUBPROCESS_TIMEOUT = 300
-# Token Gemini is instructed to append when it has no more feedback.
 NO_FEEDBACK_TOKEN = "[NO_FURTHER_FEEDBACK]"
-# Collisions we defensively strip from Gemini output — ONLY these specific
-# ledger headers, not all '### ...' lines.
 LEDGER_HEADER_PATTERNS = (
     re.compile(r"^\s*###\s+Gemini Reviewer\b", re.IGNORECASE),
+    re.compile(r"^\s*###\s+Codex Reviewer\b", re.IGNORECASE),
     re.compile(r"^\s*###\s+Primary Architect\b", re.IGNORECASE),
 )
-# Exit codes (documented contract with the slash command loop).
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_PAYLOAD_TOO_LARGE = 2
@@ -39,15 +34,38 @@ SYSTEM_INSTRUCTION = (
     "Read the current document, then read the discussion history. "
     "Address the most recent questions posed by the Primary Architect. "
     "Be brutally honest, look for edge cases, and propose concrete fixes. "
-    "You may use '### ' sub-section headers, but NEVER emit '### Gemini Reviewer' "
-    "or '### Primary Architect' — those are reserved for the ledger. "
+    "You may use '### ' sub-section headers, but NEVER emit '### Gemini Reviewer', "
+    "'### Codex Reviewer', or '### Primary Architect' — those are reserved for the ledger. "
     f"If you have no further substantive feedback, end your response with the literal token {NO_FEEDBACK_TOKEN} on its own line."
 )
 
 
+def select_reviewer() -> str:
+    """Return 'gemini' or 'codex', or exit with an error."""
+    if REVIEWER == "gemini":
+        if not shutil.which("gemini"):
+            print("ERROR: 'gemini' CLI not found. Run 'npm install -g @google/gemini-cli'.", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        return "gemini"
+    if REVIEWER == "codex":
+        if not shutil.which("codex"):
+            print("ERROR: 'codex' CLI not found. Install from https://github.com/openai/codex.", file=sys.stderr)
+            sys.exit(EXIT_ERROR)
+        return "codex"
+    # auto: prefer gemini, fall back to codex
+    if shutil.which("gemini"):
+        return "gemini"
+    if shutil.which("codex"):
+        return "codex"
+    print(
+        "ERROR: Neither 'gemini' nor 'codex' CLI found. "
+        "Install one: 'npm install -g @google/gemini-cli' or the Codex CLI.",
+        file=sys.stderr,
+    )
+    sys.exit(EXIT_ERROR)
+
+
 def resolve_ledger_paths(design_path: Path) -> tuple[Path, Path, Path]:
-    """Anchor ledger dir next to the target doc so CWD changes can't fragment state.
-    Uses .stem (not .name) so 'foo.md' → 'foo.discussion.md', not 'foo.md.discussion.md'."""
     ledger_dir = design_path.parent / ".vise"
     ledger_dir.mkdir(exist_ok=True)
     stem = design_path.stem
@@ -56,20 +74,9 @@ def resolve_ledger_paths(design_path: Path) -> tuple[Path, Path, Path]:
     return ledger_dir, ledger_path, lock_path
 
 
-def verify_dependencies():
-    if not shutil.which("gemini"):
-        print(
-            "CRITICAL ERROR: 'gemini' CLI not found. Run 'npm install -g @google/gemini-cli'.",
-            file=sys.stderr,
-        )
-        sys.exit(EXIT_ERROR)
-
-
 def next_cycle_number(ledger_content: str) -> int:
-    """Use max(cycle_numbers) + 1 instead of len(matches) so that quoted
-    references to earlier cycles can't inflate the counter."""
     real_turns = re.findall(
-        r"^### Gemini Reviewer — Cycle (\d+) \((?!SYSTEM\))",
+        r"^### (?:Gemini|Codex) Reviewer — Cycle (\d+) \((?!SYSTEM\))",
         ledger_content,
         re.MULTILINE,
     )
@@ -86,8 +93,14 @@ def strip_ledger_collisions(text: str) -> str:
     return "\n".join(kept)
 
 
+def build_subprocess_cmd(reviewer: str, cycle_prompt: str) -> list[str]:
+    if reviewer == "gemini":
+        return ["gemini", "-m", MODEL, "-p", cycle_prompt]
+    return ["codex", "exec", "-m", CODEX_MODEL, cycle_prompt]
+
+
 def parse_args():
-    ap = argparse.ArgumentParser(description="vise Gemini bridge")
+    ap = argparse.ArgumentParser(description="vise reviewer bridge")
     ap.add_argument("--design", required=True, help="path to the target document under review")
     ap.add_argument("--max-cycles", type=int, default=3, help="hard cap on debate cycles (default 3)")
     return ap.parse_args()
@@ -95,18 +108,17 @@ def parse_args():
 
 def run():
     args = parse_args()
-    verify_dependencies()
+    reviewer = select_reviewer()
+    reviewer_label = "Gemini Reviewer" if reviewer == "gemini" else "Codex Reviewer"
 
     design_path = Path(args.design).resolve()
     if not design_path.exists():
         print(f"ERROR: target document {args.design} does not exist.", file=sys.stderr)
         sys.exit(EXIT_ERROR)
 
-    ledger_dir, ledger_path, lock_path = resolve_ledger_paths(design_path)
+    _, ledger_path, lock_path = resolve_ledger_paths(design_path)
     ledger_path.touch(exist_ok=True)
 
-    # Advisory lock: open in append mode so we never truncate, and never
-    # unlink the lockfile (unlink-under-lock is a classic POSIX race).
     lock_fd = open(lock_path, "a")
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -123,13 +135,10 @@ def run():
         ledger_content = ledger_path.read_text(encoding="utf-8")
         cycle = next_cycle_number(ledger_content)
 
-        # Bridge-enforced convergence. The SYSTEM marker is excluded from the
-        # cycle counter so re-invocation after forced convergence does not
-        # infinite-loop.
         if cycle > args.max_cycles:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             marker = (
-                f"\n\n### Gemini Reviewer — Cycle {cycle} (SYSTEM) ({timestamp})\n"
+                f"\n\n### {reviewer_label} — Cycle {cycle} (SYSTEM) ({timestamp})\n"
                 f"[CONVERGENCE FORCED: reached --max-cycles={args.max_cycles}]\n"
             )
             with ledger_path.open("a", encoding="utf-8") as f:
@@ -168,16 +177,15 @@ def run():
             )
             sys.exit(EXIT_PAYLOAD_TOO_LARGE)
 
-        cmd = ["gemini", "-m", MODEL, "-p", cycle_prompt]
-        # Force UTF-8 and disable color even if the child inherits a C locale
-        # or a TTY that would otherwise leak ANSI escapes into the ledger.
+        cmd = build_subprocess_cmd(reviewer, cycle_prompt)
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["NO_COLOR"] = "1"
         env.setdefault("LANG", "en_US.UTF-8")
         env.setdefault("LC_ALL", "en_US.UTF-8")
 
-        print(f"Triggering Gemini review (cycle {cycle}/{args.max_cycles}, model={MODEL})...")
+        model_id = MODEL if reviewer == "gemini" else CODEX_MODEL
+        print(f"Triggering {reviewer_label} review (cycle {cycle}/{args.max_cycles}, model={model_id})...")
         try:
             result = subprocess.run(
                 cmd,
@@ -190,17 +198,22 @@ def run():
                 env=env,
             )
         except subprocess.TimeoutExpired:
-            print(f"GEMINI CLI TIMEOUT after {SUBPROCESS_TIMEOUT}s.", file=sys.stderr)
+            print(f"{reviewer_label.upper()} CLI TIMEOUT after {SUBPROCESS_TIMEOUT}s.", file=sys.stderr)
             sys.exit(EXIT_ERROR)
         except FileNotFoundError:
-            print("CRITICAL ERROR: 'gemini' CLI disappeared between check and exec.", file=sys.stderr)
+            print(f"CRITICAL ERROR: '{reviewer}' CLI disappeared between check and exec.", file=sys.stderr)
             sys.exit(EXIT_ERROR)
         except subprocess.CalledProcessError as e:
+            auth_hint = (
+                "run `gemini` interactively once to refresh OAuth."
+                if reviewer == "gemini"
+                else "run `codex login` to authenticate."
+            )
             print(
-                "GEMINI CLI SUBPROCESS ERROR\n"
+                f"{reviewer_label.upper()} CLI SUBPROCESS ERROR\n"
                 f"Return code: {e.returncode}\n"
                 f"Stderr:\n{e.stderr}\n"
-                "If this is an auth failure, run `gemini` interactively once to refresh OAuth.",
+                f"If this is an auth failure, {auth_hint}",
                 file=sys.stderr,
             )
             sys.exit(EXIT_ERROR)
@@ -208,7 +221,7 @@ def run():
         raw_output = (result.stdout or "").strip()
         if not raw_output:
             print(
-                f"CRITICAL ERROR: Gemini returned empty output.\nStderr:\n{result.stderr}",
+                f"CRITICAL ERROR: {reviewer_label} returned empty output.\nStderr:\n{result.stderr}",
                 file=sys.stderr,
             )
             sys.exit(EXIT_ERROR)
@@ -216,21 +229,17 @@ def run():
         signaled_done = NO_FEEDBACK_TOKEN in raw_output
 
         cleaned = strip_ledger_collisions(raw_output).strip()
-        # If defensive stripping removed everything (shouldn't happen, but
-        # don't false-positive an "empty output" error), fall back to raw.
-        gemini_output = cleaned if cleaned else raw_output
+        reviewer_output = cleaned if cleaned else raw_output
 
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with ledger_path.open("a", encoding="utf-8") as f:
-            f.write(f"\n\n### Gemini Reviewer — Cycle {cycle} ({timestamp})\n")
-            f.write(f"{gemini_output}\n")
+            f.write(f"\n\n### {reviewer_label} — Cycle {cycle} ({timestamp})\n")
+            f.write(f"{reviewer_output}\n")
 
         if signaled_done:
-            print(f"SUCCESS: Cycle {cycle} appended. Gemini signaled {NO_FEEDBACK_TOKEN}.")
+            print(f"SUCCESS: Cycle {cycle} appended. {reviewer_label} signaled {NO_FEEDBACK_TOKEN}.")
             sys.exit(EXIT_NO_FURTHER_FEEDBACK)
 
-        # If this WAS the last allowed cycle, tell Claude to tie-break now
-        # instead of wasting a turn drafting Cycle N+1 just to be rejected.
         if cycle >= args.max_cycles:
             print(
                 f"SUCCESS: Cycle {cycle} appended. Final cycle (max-cycles={args.max_cycles}) "
@@ -245,9 +254,6 @@ def run():
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             lock_fd.close()
-        # NOTE: We intentionally do NOT unlink lock_path. Unlink-under-lock is
-        # a POSIX race: another process that has the file open can acquire a
-        # lock on a stale inode and bypass the mutex.
 
 
 if __name__ == "__main__":

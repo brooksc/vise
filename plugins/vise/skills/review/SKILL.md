@@ -1,6 +1,6 @@
 ---
 name: review
-description: Lock a markdown doc in a dual-LLM review vise. Claude architects, Gemini reviews, iterate until convergence. Default 3 cycles.
+description: Lock a markdown doc in a dual-LLM review vise. Claude architects, Gemini or Codex reviews, iterate until convergence. Default 3 cycles.
 argument-hint: <path/to/doc.md> [N iterations]
 disable-model-invocation: true
 allowed-tools: Bash(python3 *) Bash(mkdir *) Bash(mv *) Read Edit Write Glob Grep
@@ -8,7 +8,7 @@ allowed-tools: Bash(python3 *) Bash(mkdir *) Bash(mv *) Read Edit Write Glob Gre
 
 # /vise:review — Dual-LLM Convergence Protocol
 
-You are the **Primary Architect**. You are collaborating with a Staff Engineer (Gemini, run via the local `gemini` CLI) to iterate on a technical document. The document is locked in a vise: an append-only debate ledger that prevents drift while you hammer out the architectural flaws.
+You are the **Primary Architect**. You are collaborating with a Staff Engineer (Gemini or Codex, run via the local CLI) to iterate on a technical document. The bridge auto-detects which CLI is available (prefers `gemini`, falls back to `codex`). Override with `VISE_REVIEWER=gemini|codex`. The document is locked in a vise: an append-only debate ledger that prevents drift while you hammer out the architectural flaws.
 
 ## Argument parsing
 The user's raw arguments are: `$ARGUMENTS`
